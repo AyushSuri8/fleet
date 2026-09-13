@@ -29,13 +29,13 @@ def write_status(cfg, state, extra=None):
     p = str(Path(p).expanduser()) if p.startswith("~") else p
     Path(p).parent.mkdir(parents=True, exist_ok=True)
     tmp = p + ".tmp"
-    Path(tmp).write_text(json.dumps(payload))
-    # ensure durability on persistent HOME (not /tmp)
-    try:
-        import os as _os
-        _os.fsync(open(tmp, "r").fileno())
-    except Exception:
-        pass
+    # FIX: the old version did `open(tmp, "r").fileno()` for fsync and never
+    # closed it -> one leaked fd per write (EMFILE after hours -> worker
+    # crash-loops). One context manager does write + flush + fsync.
+    with open(tmp, "w") as f:
+        f.write(json.dumps(payload))
+        f.flush()
+        os.fsync(f.fileno())  # durable on persistent HOME (not /tmp)
     os.replace(tmp, p)
 
 

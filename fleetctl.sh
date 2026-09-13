@@ -6,7 +6,8 @@ cd "$(dirname "$0")"
 
 # fix IDX libstdc++ for any Python invocation
 if ! LD_LIBRARY_PATH="" .venv/bin/python -c "import grpc" 2>/dev/null; then
-  for d in /nix/store/*gcc*lib/lib; do
+  for d in /nix/store/*gcc*lib/lib /usr/lib/x86_64-linux-gnu /lib/x86_64-linux-gnu /usr/lib64; do
+    [[ -d "$d" ]] || continue
     if LD_LIBRARY_PATH="$d" .venv/bin/python -c "import grpc" 2>/dev/null; then
       export LD_LIBRARY_PATH="$d:${LD_LIBRARY_PATH:-}"
       break

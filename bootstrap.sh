@@ -35,10 +35,12 @@ if ! [[ "$NODE_ID" =~ ^shell-[a-d]$ ]]; then
   echo "NODE_ID=$NODE_ID invalid, must be shell-a..d" >&2
   exit 1
 fi
-tmp=$(mktemp)
+# FIX: tmp on the same filesystem as the target so mv is atomic (was /tmp,
+# cross-device) — and $HOME persists, which is the whole point.
+tmp="$(mktemp "$HOME/.fleet-node-id.XXXXXX")"
 printf '%s\n' "$NODE_ID" > "$tmp"
 chmod 600 "$tmp"
-mv "$tmp" "$HOME/.fleet-node-id" 2>/dev/null || true
+mv -f "$tmp" "$HOME/.fleet-node-id"
 export FLEET_NODE_ID="$NODE_ID"
 echo "==> Node id: $NODE_ID"
 
@@ -84,11 +86,12 @@ echo "==> Project: $PROJECT_ID (shared Firestore for all nodes)"
 # --- dependencies (root disk is ephemeral; reinstall every boot) ---
 echo "==> Installing Python dependencies"
 if [[ ! -d .venv ]]; then python3 -m venv .venv; fi
-if [[ -d ".venv" ]] && LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" .venv/bin/python -c "from google.cloud import firestore" 2>/dev/null; then
-  echo "    dependencies already present in .venv"
-else
-  python3 -m pip install --quiet -r requirements.txt
-  LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" .venv/bin/python -m pip install --quiet -r requirements.txt 2>&1 | tail -n 5 || true
+if ! LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" .venv/bin/python -c "from google.cloud import firestore" 2>/dev/null; then
+  # FIX: install INTO the venv. (The old first line ran plain `python3 -m pip
+  # install`, which went to user site-packages — a silent no-op for the venv
+  # interpreter the fleet actually runs.)
+  .venv/bin/python -m pip install --quiet --upgrade pip 2>/dev/null || true
+  .venv/bin/python -m pip install --quiet -r requirements.txt
 fi
 
 # --- verify Firestore + seed lease + usage docs ---

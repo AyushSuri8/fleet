@@ -1,0 +1,34 @@
+name: enqueue
+on:
+  repository_dispatch:
+    types: [enqueue]
+  workflow_dispatch:
+    inputs:
+      type:    { description: "job type", default: "echo" }
+      payload: { description: "JSON payload", default: "{}" }
+      jobId:   { description: "optional client-supplied id" }
+
+permissions:
+  contents: read
+
+jobs:
+  enqueue:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install google-cloud-firestore
+      - name: write SA creds
+        run: |
+          echo "$FIREBASE_SERVICE_ACCOUNT" > "$HOME/sa.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/sa.json" >> "$GITHUB_ENV"
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      - name: enqueue job
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          JOB_ID:        ${{ github.event.client_payload.jobId || github.event.inputs.jobId }}
+          JOB_TYPE:      ${{ github.event.client_payload.type || github.event.inputs.type }}
+          JOB_PAYLOAD:   ${{ toJSON(github.event.client_payload.payload || github.event.inputs.payload) }}
+        run: python scripts/enqueue_worker.py

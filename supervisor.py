@@ -68,7 +68,11 @@ def main():
         db, cfg["node"]["id"],
         cfg["lease"]["collection"], cfg["lease"]["doc_id"],
         cfg["lease"]["ttl_seconds"],
-        take_grace,
+        # FIX: defer-to-preferred window must cover the SAME-SHELL reclaim
+        # grace (90s), not just takeover grace (45s) — otherwise another node
+        # grabs the lease 45s into the documented 90s reclaim window.
+        # (reclaim_grace was previously read here and never used.)
+        max(take_grace, reclaim_grace),
         ring=ring,
     )
     poll = int(cfg["lease"]["poll_interval_seconds"])
@@ -85,6 +89,17 @@ def main():
     active_since = None
     draining = False
     last_loop = time.monotonic()
+    usage_flush_every = 60.0   # FIX: batch usage writes (1/min, not 1/10s)
+    pending_active = 0.0
+
+    def flush_usage():
+        nonlocal pending_active
+        if pending_active > 0:
+            try:
+                usage_tracker.add_active(db, cfg, cfg["node"]["id"], pending_active)
+            except Exception:
+                log.warning("usage flush failed", exc_info=True)
+            pending_active = 0.0
 
     def start_server():
         cmd = server_cmd(cfg)
@@ -123,6 +138,7 @@ def main():
                 if active_since is not None:
                     log.info("quota exhausted; handing off")
                     stop_server()
+                    flush_usage()
                     nxt = usage_tracker.pick_next_with_quota(
                         db, cfg, ring, exclude=cfg["node"]["id"])
                     lease.release(reason="quota-exhausted", preferred=nxt)
@@ -139,14 +155,16 @@ def main():
                     draining = False
                     log.info("ACTIVE fenceToken=%s quota_left_h=%.1f",
                              fence, my_remaining / 3600.0)
-                # account active time toward weekly quota
-                try:
-                    usage_tracker.add_active(db, cfg, cfg["node"]["id"],
-                                             min(elapsed, poll * 2))
-                    my_remaining = usage_tracker.remaining_seconds(
-                        db, cfg, cfg["node"]["id"])
-                except Exception as e:
-                    log.warning("usage accounting failed: %s", e)
+                # account active time toward weekly quota (batched)
+                pending_active += max(0.0, min(elapsed, poll * 2))
+                if pending_active >= usage_flush_every:
+                    try:
+                        usage_tracker.add_active(db, cfg, cfg["node"]["id"], pending_active)
+                        pending_active = 0.0
+                        my_remaining = usage_tracker.remaining_seconds(
+                            db, cfg, cfg["node"]["id"])
+                    except Exception as e:
+                        log.warning("usage accounting failed: %s", e)
 
                 overdue = (rotation_on and max_active > 0 and active_since and
                            (utcnow() - active_since).total_seconds() >= max_active)
@@ -166,6 +184,7 @@ def main():
                             db, cfg, ring, exclude=cfg["node"]["id"])
                         if nxt is None and not quota_hit:
                             nxt = cfg["node"]["id"]  # no successor; allow self-reclaim
+                        flush_usage()
                         lease.release(reason=reason, preferred=nxt)
                         active_since = None
                         fence = 0
@@ -183,6 +202,7 @@ def main():
             else:
                 if active_since is not None:
                     log.info("lost lease; going standby")
+                flush_usage()
                 active_since = None
                 fence = 0
                 if proc is not None:
@@ -223,6 +243,7 @@ def main():
 
     log.info("supervisor stopping")
     stop_server(timeout=60)
+    flush_usage()
     try:
         # prefer self so a quick restart of THIS shell reclaims the server
         lease.release(reason="supervisor-shutdown", preferred=cfg["node"]["id"])

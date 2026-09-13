@@ -67,11 +67,15 @@ echo "==> fleet supervisor node=$FLEET_NODE_ID project=$GOOGLE_CLOUD_PROJECT log
 (
   while true; do
     sleep 300
-    date -u +"%FT%TZ keepalive $FLEET_NODE_ID fence=$(cat $HOME/.fleet/status.json 2>/dev/null | grep fenceToken | head -1 || echo ?)" >> "$HOME/.fleet/keepalive.log" 2>/dev/null || true
+    date -u +"%FT%TZ keepalive $FLEET_NODE_ID fence=$(cat "$HOME/.fleet/status.json" 2>/dev/null | grep fenceToken | head -1 || echo ?)" >> "$HOME/.fleet/keepalive.log" 2>/dev/null || true
     # keep tmux server from being considered idle (no-op, ignored if tmux missing)
     tmux refresh-client -t fleet 2>/dev/null || true
   done
 ) &
 
-# run supervisor directly; caller handles backgrounding / log tee
-exec .venv/bin/python supervisor.py >> "$LOG" 2>&1
+# idle keepalive NOTE (FIX): the supervisor's 120s "still active" stdout
+# heartbeat only keeps the tmux pane non-idle if it reaches the pane. The old
+# `exec ... >> "$LOG" 2>&1` sent everything to the file, so the pane was
+# permanently silent and Cloud Shell could reap the "idle" session — the
+# exact thing this keepalive was added to prevent. tee writes to BOTH.
+exec .venv/bin/python supervisor.py 2>&1 | tee -a "$LOG"

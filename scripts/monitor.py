@@ -108,9 +108,12 @@ def main():
                     total_left += QUOTA_SECONDS
                 else:
                     total_left += max(0.0, QUOTA_SECONDS - used)
-                # nodes with no doc count as full quota
-                if n not in usage_nodes:
-                    total_left = QUOTA_SECONDS if not ud else total_left
+                # REMOVED (bug): this RESET the running total instead of
+                # adding — any node without a usage doc caused a false
+                # QUOTA-FLEET-LOW. Doc-less nodes already add full quota via
+                # used=0 above.
+                # if n not in usage_nodes:
+                #     total_left = QUOTA_SECONDS if not ud else total_left
             if total_left < 24 * 3600:
                 problems.append(f"QUOTA-FLEET-LOW: only {total_left/3600:.1f}h left across fleet")
     except Exception as e:

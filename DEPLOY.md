@@ -150,9 +150,12 @@ curl -s -X POST https://fleet-frontdoor.ayushsuri37.workers.dev/jobs \
 curl "https://fleet-frontdoor.ayushsuri37.workers.dev/jobs/<id>"
 # -> status "completed" with result
 
-# Auto-boot proof: kill the active shell -> lease opens -> >3 min ->
-# cron starts the steered SUSPENDED VM -> its .customize_environment hook
-# rejoins -> fenceToken+1 in /fleet/status.
+# Auto-boot: kill the active shell -> lease opens -> >3 min -> cron starts the
+# steered SUSPENDED VM -> **a real session attach (or scripts/rescue_node.py)
+# runs .customize_environment -> fenceToken+1**. The API `:start` alone boots
+# the VM but does NOT run the hook (see §10) — auto-boot only readies the VM.
+# If /fleet/status shows FLEET-DARK (VMs RUNNING, no heartbeats), rescue
+# manually: attach a session or run scripts/rescue_node.py.
 ```
 
 ---

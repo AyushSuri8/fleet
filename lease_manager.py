@@ -59,7 +59,13 @@ class LeaseManager:
             pref_at = as_aware(data.get("preferredAt"))
 
             if holder == self.node_id:
-                # I already hold it -> renew (section 6 supervisor loop)
+                # I already hold it -> renew (section 6 supervisor loop).
+                # FIX: only write when less than half the TTL remains —
+                # writing on every 10s poll was ~8.6k lease writes/day on the
+                # active node (daily RESOURCE_EXHAUSTED risk on free tier).
+                remaining = (expires - now).total_seconds() if expires else 0
+                if remaining > self.ttl / 2:
+                    return data
                 data.update(
                     leaseExpiresAt=now + timedelta(seconds=self.ttl),
                     lastHeartbeat=now,

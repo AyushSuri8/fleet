@@ -92,7 +92,13 @@ const BASE = (project) =>
   const RING = ["shell-a", "shell-b", "shell-c", "shell-d"];
   const HEARTBEAT_MAX_AGE_S = 90;    // matches scripts/monitor.py default
   const LEASE_MAX_AGE_S = 60;        // lease stale this long past expiry
-  const TAKEOVER_GRACE_S = 45;       // mirrors lease.takeover_grace_seconds
+  // Was 45 — LESS than the 60s cron tick, so fleetManage re-steered the
+  // preferredNextNode hint on EVERY pass (a->b->c->d->a...): the auto-boot
+  // target rotated away before any booted VM could attach + bootstrap.
+  // Now matches rotation.reclaim_grace_seconds (90) so the same-shell
+  // reclaim window is honored fleet-wide.
+  const TAKEOVER_GRACE_S = 90;
+  const STEER_ROTATE_S = 600;      // NEW: keep one preferred target this long before rotating past a dead hint
   const HOLDER_STUCK_S = 180;        // holder silent this long -> force-expire
   const BACKLOG_LIMIT = 50;
   const QUOTA_SECONDS = 180000;      // 50h per shell/week
@@ -309,6 +315,21 @@ const BASE = (project) =>
     return out;
   }
 
+  // Equality-filter query via :runQuery — uses the automatic single-field
+  // index, no composite index needed. Replaces the old backlog probe that
+  // listed the first N docs of the collection unfiltered (completed jobs
+  // crowd out queued ones => BACKLOG could never fire reliably).
+  async function saRunQuery(project, token, structuredQuery) {
+    const r = await fetch(`${BASE(project)}:runQuery`, {
+      method: "POST",
+      headers: { ...saHeaders(token), "content-type": "application/json" },
+      body: JSON.stringify({ structuredQuery }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`${r.status} ${JSON.stringify(body.error || body).slice(0, 200)}`);
+    return Array.isArray(body) ? body : [];
+  }
+
   async function saPatchDoc(project, token, path, fields) {
     const mask = Object.keys(fields).map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join("&");
     const r = await fetch(`${BASE(project)}/${path}?${mask}`, {
@@ -363,11 +384,13 @@ const BASE = (project) =>
     }
 
     const roster = [];
+    const freshByNode = {};                       // NEW
     for (const [id, d] of Object.entries(byId)) {
       if (!id.startsWith("health-")) continue;
       const node = d.node || id.slice("health-".length);
       const ts = d.timestamp ? Date.parse(d.timestamp) : NaN;
       const fresh = Number.isFinite(ts) && nowMs - ts <= HEARTBEAT_MAX_AGE_S * 1000;
+      freshByNode[node] = fresh;                  // NEW
       roster.push(`${node}(${fresh ? "up" : "down"})`);
       if (fresh && active && node !== active && d.appHealthy) {
         problems.push(`SPLIT-BRAIN: ${node} reports healthy but lease says ${active}`);
@@ -384,6 +407,24 @@ const BASE = (project) =>
         if (vmByNode[n] === "SUSPENDED" && !joined.includes(n)) {
           notes.push(`${n}: VM suspended, never joined (no health doc)`);
         }
+      }
+      // NEW: RUNNING != healthy. A Cloud Shell VM can be RUNNING (watchdog
+      // :start, lingering boot) with zero fleet software inside — the exact
+      // 2026-09-13 dark-fleet signature, which used to produce NO problem
+      // line, so nobody got paged with the real cause.
+      const darkRunning = RING.filter((n) => vmByNode[n] === "RUNNING" && !freshByNode[n]);
+      if (darkRunning.length) {
+        notes.push(`vm RUNNING but fleet software dark (no fresh heartbeat): ${darkRunning.join(", ")}`);
+      }
+      const anyFresh = Object.values(freshByNode).some(Boolean);
+      if (!active && !anyFresh && darkRunning.length) {
+        problems.push(
+          "FLEET-DARK: lease open, no fresh heartbeats anywhere, yet VMs are RUNNING — " +
+          "no supervisor is alive. API :start does NOT re-run .customize_environment; " +
+          "attach a Cloud Shell session or run scripts/rescue_node.py");
+      }
+      if (!active && running.length === 0 && !Object.values(vmByNode).some((v) => String(v).startsWith("error"))) {
+        problems.push("VMS-DARK: no Cloud Shell VM is RUNNING (Google ground truth)");
       }
     } else {
       const missing = RING.filter((n) => !joined.includes(n));
@@ -427,12 +468,6 @@ const BASE = (project) =>
     if (queuedCount > BACKLOG_LIMIT) {
       problems.push(`BACKLOG: ${queuedCount} queued > limit ${BACKLOG_LIMIT}`);
     }
-    if (vmByNode) {
-      const running = RING.filter((n) => vmByNode[n] === "RUNNING");
-      if (!active && running.length === 0 && !Object.values(vmByNode).some((v) => String(v).startsWith("error"))) {
-        problems.push("VMS-DARK: no Cloud Shell VM is RUNNING (Google ground truth)");
-      }
-    }
     if (oauth) {
       const dead = RING.filter((n) => oauth[n] && oauth[n].needsConsent);
       for (const n of dead) {
@@ -443,10 +478,15 @@ const BASE = (project) =>
   }
 
   // Firestore-level management: reap a dead holder / free a stuck lease /
-  // steer an open lease at the next ring node with quota. Never touches
-  // fenceToken (only a lease holder's transaction may increment it).
-  // Returns {actions, steerTarget}.
-  async function fleetManage(project, token, check, serverDocs, nowMs, vmByNode) {
+  // steer an open lease at a node that can actually take it.
+  // Never touches fenceToken (only a lease holder's transaction may increment it).
+  //
+  // FIX (2026-09-13 incident): steering used to rotate the hint on EVERY pass
+  // (grace 45s < 60s tick), so the auto-boot target moved before any booted
+  // VM could possibly rejoin. Steering is now STICKY: a viable hint is kept
+  // for STEER_ROTATE_S; rotate past it only when out of quota, auth-dead,
+  // or it has had its window without claiming.
+  async function fleetManage(project, token, check, serverDocs, nowMs, vmByNode, oauth) {
     const actions = [];
     let steerTarget = null;
     const byId = {};
@@ -494,24 +534,35 @@ const BASE = (project) =>
       }
     }
 
-    // No active node: only steer once the previous hint's grace has passed,
-    // otherwise we fight the normal same-shell reclaim path — unless ground
-    // truth says NO VM is RUNNING, in which case nobody can reclaim and
-    // waiting would just delay the auto-boot of a dark fleet.
+    // No active node. Give a just-set hint (or the same-shell reclaim right
+    // after a release) its full grace window — unless NO VM is RUNNING, in
+    // which case nobody can reclaim and waiting only delays the auto-boot.
     const pref = typeof lease.preferredNextNode === "string" ? lease.preferredNextNode : null;
     const prefMs = lease.preferredAt ? Date.parse(lease.preferredAt) : NaN;
+    const prefAgeS = Number.isFinite(prefMs) ? (nowMs - prefMs) / 1000 : Infinity;
     const runningAny = vmByNode ? RING.some((n) => vmByNode[n] === "RUNNING") : false;
-    if (runningAny && Number.isFinite(prefMs) && nowMs - prefMs < TAKEOVER_GRACE_S * 1000) return { actions, steerTarget };
+    if (runningAny && Number.isFinite(prefMs) && prefAgeS < TAKEOVER_GRACE_S) return { actions, steerTarget };
+
+    const hintViable = (n) =>
+      (check.leftByNode[n] ?? QUOTA_SECONDS) > 0
+      && !(oauth && oauth[n] && oauth[n].needsConsent);   // dead refresh token can't be booted
+
+    // Sticky hint: keep the current target while viable and it has not yet
+    // had a fair window (VM boot + bootstrap takes minutes, not seconds).
+    if (pref && hintViable(pref) && prefAgeS < STEER_ROTATE_S) {
+      return { actions, steerTarget: pref };
+    }
+
     const startIdx = RING.indexOf(pref);
     for (let step = 1; step <= RING.length; step++) {
       const node = RING[((startIdx < 0 ? -1 : startIdx) + step) % RING.length];
-      if ((check.leftByNode[node] ?? QUOTA_SECONDS) > 0) {
+      if (hintViable(node)) {
         if (node !== pref) {
           await saPatchDoc(project, token, "server/lease", {
             preferredNextNode: { stringValue: node },
             preferredAt: { timestampValue: new Date(nowMs).toISOString() },
           });
-          actions.push(`steered preferredNextNode ${pref || "(none)"} -> ${node} (open lease, next with quota)`);
+          actions.push(`steered preferredNextNode ${pref || "(none)"} -> ${node} (open lease, sticky hint)`);
         }
         steerTarget = node;
         break;
@@ -522,7 +573,12 @@ const BASE = (project) =>
 
   // One watchdog pass: VM truth -> check fleet, manage lease, maybe boot the
   // steered VM, write server/watchdog, alert on change (+30m reminder).
-  async function watchdogPass(env, state) {
+  // opts.manage === false -> READ-ONLY (GET /fleet/status): checks and VM
+  // truth only — no steering, no VM start, no alert, no writes. A status
+  // poke used to run the FULL manage path: every curl could boot a VM and
+  // churn preferredNextNode.
+  async function watchdogPass(env, state, opts = {}) {
+    const manage = opts.manage !== false;
     const project = env.GCP_PROJECT_ID;
     const nowMs = Date.now();
     const token = await saAccessToken(env.FLEET_SA_KEY, state);
@@ -530,14 +586,18 @@ const BASE = (project) =>
     // Bounded backlog probe: list capped at BACKLOG_LIMIT+1 (no index needed).
     let queuedCount = 0;
     try {
-      const reqDocs = await saListDocs(project, token, "requests", BACKLOG_LIMIT + 1);
-      for (const d of reqDocs) {
-        const f = fromFields(d.fields || {});
-        if (f.status === "queued") {
-          queuedCount += 1;
-          if (queuedCount > BACKLOG_LIMIT) break;
-        }
-      }
+      const qr = await saRunQuery(project, token, {
+        from: [{ collectionId: "requests" }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: "status" },
+            op: "EQUAL",
+            value: { stringValue: "queued" },
+          },
+        },
+        limit: BACKLOG_LIMIT + 1,
+      });
+      queuedCount = qr.filter((e) => e.document).length;
     } catch (e) {
       queuedCount = 0;
     }
@@ -557,13 +617,15 @@ const BASE = (project) =>
       }
     }
     const check = fleetCheck(serverDocs, queuedCount, nowMs, vmByNode, oauth);
-    const { actions, steerTarget } = await fleetManage(project, token, check, serverDocs, nowMs, vmByNode);
+    const { actions, steerTarget } = manage
+      ? await fleetManage(project, token, check, serverDocs, nowMs, vmByNode, oauth)
+      : { actions: [], steerTarget: null };
 
     // Auto-boot (gated): lease open a while, steered node has quota, its VM
     // is SUSPENDED, and no start attempted fleet-wide within cooldown.
     // Booting only puts the VM at a login prompt; .customize_environment on
     // the shell must launch run.sh for it to actually rejoin.
-    if (!check.active && steerTarget && vmByNode && vmByNode[steerTarget] === "SUSPENDED"
+    if (manage && !check.active && steerTarget && vmByNode && vmByNode[steerTarget] === "SUSPENDED"
         && (check.leftByNode[steerTarget] ?? QUOTA_SECONDS) > 0) {
       const prevDoc0 = await saGetDoc(project, token, `server/${WATCHDOG_DOC}`);
       const prev0 = prevDoc0 ? fromFields(prevDoc0.fields || {}) : {};
@@ -574,16 +636,23 @@ const BASE = (project) =>
         : (lease0.leaseExpiresAt ? nowMs - Date.parse(lease0.leaseExpiresAt) : 0);
       const cooled = !Number.isFinite(lastStart) || nowMs - lastStart >= VM_START_COOLDOWN_S * 1000;
       if (openMs >= VM_OPEN_AFTER_S * 1000 && cooled) {
+        let started = false;
         try {
           await shellVmStart(env, state, steerTarget);
           actions.push(`started Cloud Shell VM for ${steerTarget} (lease open ${Math.round(openMs / 1000)}s)`);
-          await saPatchDoc(project, token, `server/${WATCHDOG_DOC}`, {
-            lastVmStartAt: { timestampValue: new Date(nowMs).toISOString() },
-            lastVmStartNode: { stringValue: steerTarget },
-          });
+          started = true;
         } catch (e) {
           actions.push(`VM start FAILED for ${steerTarget}: ${String(e).slice(0, 160)}`);
         }
+        // Record the ATTEMPT either way: a failing :start used to retry every
+        // tick because the cooldown stamp was only written on success.
+        try {
+          await saPatchDoc(project, token, `server/${WATCHDOG_DOC}`, {
+            lastVmStartAt: { timestampValue: new Date(nowMs).toISOString() },
+            lastVmStartNode: { stringValue: steerTarget },
+            lastVmStartOk: { booleanValue: started },
+          });
+        } catch (e) { /* bookkeeping is best-effort */ }
       }
     }
 
@@ -592,37 +661,46 @@ const BASE = (project) =>
     const alertKey = [...check.problems].sort().join("|") || "ok";
     const prevKey = typeof prev.lastAlertKey === "string" ? prev.lastAlertKey : "";
     const prevAt = prev.lastAlertAt ? Date.parse(prev.lastAlertAt) : NaN;
-    const shouldAlert = !check.ok && (alertKey !== prevKey
+    const shouldAlert = manage && !check.ok && (alertKey !== prevKey
       || !Number.isFinite(prevAt) || nowMs - prevAt >= ALERT_REMIND_S * 1000);
     if (shouldAlert && env.ALERT_WEBHOOK_URL) {
       try {
         await fetch(env.ALERT_WEBHOOK_URL, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ content: `fleet watchdog: ${check.problems.join("; ")}` }),
+          // "text" for Slack-shaped webhooks, "content" for Discord-shaped;
+          // each ignores the other key.
+          body: JSON.stringify({
+            text: `fleet watchdog: ${check.problems.join("; ")}`,
+            content: `fleet watchdog: ${check.problems.join("; ")}`,
+          }),
         });
       } catch (e) { /* alert best-effort; state below still records */ }
     }
 
     const summary = {
-      ok: check.ok, activeNode: check.active, problems: check.problems,
-      notes: check.notes, actions,
+      ok: check.ok, activeNode: check.active, fenceToken: check.fence,
+      problems: check.problems, notes: check.notes,
+      actions: manage ? actions : (Array.isArray(prev.actions) ? prev.actions : []),
+      readOnly: !manage,
       vm: vmByNode,
       oauthHelp: oauth ? "GET /fleet/oauth-help (or ?node=<shell-x>) for re-consent URLs of expired tokens" : null,
       at: new Date(nowMs).toISOString(),
     };
-    const wfields = {
-      ok: { booleanValue: check.ok },
-      activeNode: check.active ? { stringValue: check.active } : { nullValue: null },
-      problems: { arrayValue: { values: check.problems.map((p) => ({ stringValue: p })) } },
-      notes: { arrayValue: { values: check.notes.map((n) => ({ stringValue: n })) } },
-      actions: { arrayValue: { values: actions.map((a) => ({ stringValue: a })) } },
-      checkedAt: { timestampValue: new Date(nowMs).toISOString() },
-      lastAlertKey: { stringValue: shouldAlert ? alertKey : (prevKey || alertKey) },
-      lastAlertAt: { timestampValue: shouldAlert ? new Date(nowMs).toISOString()
-        : (prev.lastAlertAt || new Date(nowMs).toISOString()) },
-    };
-    await saPatchDoc(project, token, `server/${WATCHDOG_DOC}`, wfields);
+    if (manage) {
+      const wfields = {
+        ok: { booleanValue: check.ok },
+        activeNode: check.active ? { stringValue: check.active } : { nullValue: null },
+        problems: { arrayValue: { values: check.problems.map((p) => ({ stringValue: p })) } },
+        notes: { arrayValue: { values: check.notes.map((n) => ({ stringValue: n })) } },
+        actions: { arrayValue: { values: actions.map((a) => ({ stringValue: a })) } },
+        checkedAt: { timestampValue: new Date(nowMs).toISOString() },
+        lastAlertKey: { stringValue: shouldAlert ? alertKey : (prevKey || alertKey) },
+        lastAlertAt: { timestampValue: shouldAlert ? new Date(nowMs).toISOString()
+          : (prev.lastAlertAt || new Date(nowMs).toISOString()) },
+      };
+      await saPatchDoc(project, token, `server/${WATCHDOG_DOC}`, wfields);
+    }
     return summary;
   }
   
@@ -635,7 +713,9 @@ const BASE = (project) =>
       if (request.method === "GET" && pathname === "/fleet/status") {
         if (!env.FLEET_SA_KEY) return json({ error: "watchdog not configured" }, 503);
         try {
-          const summary = await watchdogPass(env, {});
+          // READ-ONLY pass: no steering, no VM start, no writes. The cron
+          // tick is the only actor.
+          const summary = await watchdogPass(env, {}, { manage: false });
           return json(summary);
         } catch (e) {
           return json({ error: "watchdog failed", detail: String(e).slice(0, 300) }, 502);
@@ -670,6 +750,12 @@ const BASE = (project) =>
       }
   
       if (request.method === "POST" && pathname === "/jobs") {
+        // Optional shared secret: set FRONTDOOR_TOKEN (secret) and clients
+        // must send x-fleet-token. Without it this endpoint is open to
+        // anyone who finds the URL.
+        if (env.FRONTDOOR_TOKEN && request.headers.get("x-fleet-token") !== env.FRONTDOOR_TOKEN) {
+          return json({ error: "unauthorized" }, 401);
+        }
         let body;
         try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
         const type = body.type;
