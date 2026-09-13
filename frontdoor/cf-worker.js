@@ -10,6 +10,20 @@
  * GET  /fleet/status  -> read-only fleet summary {ok, activeNode, problems, notes}
  * cron * * * * *      -> fleetCheck + management actions + alert webhook
  *
+ * VM truth + auto-boot (Option A: per-account OAuth refresh tokens):
+ * env SHELL_ACCOUNT_<A|B|C|D> = Google account email owning that shell.
+ * secrets OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET = ONE Google Cloud OAuth
+ *   client (type "Desktop app", any of your projects) used to mint tokens
+ *   for all 4 shell accounts.
+ * secrets SHELL_A_REFRESH / SHELL_B_REFRESH / SHELL_C_REFRESH / SHELL_D_REFRESH
+ *   = per-account refresh tokens from a one-time consent per shell account.
+ * Each tick the watchdog mints that node's access token and calls
+ * GET users/<email>/environments/default -> state RUNNING|SUSPENDED|PENDING.
+ * VM state is reported in notes; when the lease has been open >VM_OPEN_AFTER_S
+ * with quota left and the steered node's VM is SUSPENDED, the watchdog calls
+ * POST ...:start (gated by VM_START_COOLDOWN_S fleet-wide) so the VM boots and
+ * its .customize_environment hook rejoins the fleet on its own.
+ *
  * Management actions (Firestore-level; Workers cannot boot Cloud Shell VMs):
  *  1. stuck holder (lease unexpired, holder heartbeat stale >180s): force-expire
  *     the lease so a RUNNING standby takes over instead of waiting out the TTL.
@@ -85,6 +99,9 @@ const BASE = (project) =>
   const WEEK_SECONDS = 604800;       // 168h sliding window
   const ALERT_REMIND_S = 1800;       // re-alert every 30m while bad
   const WATCHDOG_DOC = "watchdog";
+  const VM_OPEN_AFTER_S = 180;       // lease open this long before a VM start is attempted
+  const VM_START_COOLDOWN_S = 600;   // min gap between VM start attempts fleet-wide
+  const CLOUDSHELL_API = "https://cloudshell.googleapis.com/v1";
 
   function strVal(v) {
     if (v === null || v === undefined) return null;
@@ -149,6 +166,85 @@ const BASE = (project) =>
 
   const saHeaders = (token) => ({ authorization: `Bearer ${token}` });
 
+  // ---- Cloud Shell per-account OAuth (Option A) ----
+  // One shared OAuth client (Desktop app), one refresh token per shell
+  // account. Minted access tokens cached on `state` per node.
+  function shellAccountEmail(env, node) {
+    const suffix = node.split("-")[1].toUpperCase(); // shell-a -> A
+    return (env[`SHELL_ACCOUNT_${suffix}`] || "").trim() || null;
+  }
+
+  function shellRefresh(env, node) {
+    const suffix = node.split("-")[1].toUpperCase();
+    return env[`SHELL_${suffix}_REFRESH`] || null;
+  }
+
+  function oauthClient(env) {
+    if (!env.OAUTH_CLIENT_ID || !env.OAUTH_CLIENT_SECRET) return null;
+    return { id: env.OAUTH_CLIENT_ID, secret: env.OAUTH_CLIENT_SECRET };
+  }
+
+  async function shellAccessToken(env, state, node) {
+    state.shellTok = state.shellTok || {};
+    const cached = state.shellTok[node];
+    const nowS = Math.floor(Date.now() / 1000);
+    if (cached && cached.exp > nowS + 60) return cached.token;
+    const client = oauthClient(env);
+    const refresh = shellRefresh(env, node);
+    if (!client || !refresh) throw new Error(`no OAuth configured for ${node}`);
+    const r = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: client.id,
+        client_secret: client.secret,
+        refresh_token: refresh,
+        grant_type: "refresh_token",
+      }).toString(),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`refresh ${node} failed: ${r.status} ${JSON.stringify(body).slice(0, 160)}`);
+    state.shellTok[node] = { token: body.access_token, exp: nowS + (body.expires_in || 3600) };
+    return body.access_token;
+  }
+
+  // Ground truth from Google: RUNNING | SUSPENDED | PENDING | ... (or
+  // "unconfigured" when no OAuth for that node, "error:..." on failure).
+  async function shellVmState(env, state, node) {
+    const email = shellAccountEmail(env, node);
+    if (!email) return "unconfigured";
+    let token;
+    try {
+      token = await shellAccessToken(env, state, node);
+    } catch (e) {
+      return `error: ${String(e).slice(0, 120)}`;
+    }
+    try {
+      const r = await fetch(
+        `${CLOUDSHELL_API}/users/${encodeURIComponent(email)}/environments/default`,
+        { headers: { authorization: `Bearer ${token}` } },
+      );
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) return `error: ${r.status} ${JSON.stringify(body.error || body).slice(0, 120)}`;
+      return body.state || "unknown";
+    } catch (e) {
+      return `error: ${String(e).slice(0, 120)}`;
+    }
+  }
+
+  async function shellVmStart(env, state, node) {
+    const email = shellAccountEmail(env, node);
+    if (!email) throw new Error(`no account email for ${node}`);
+    const token = await shellAccessToken(env, state, node);
+    const r = await fetch(
+      `${CLOUDSHELL_API}/users/${encodeURIComponent(email)}/environments/default:start`,
+      { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: "{}" },
+    );
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`${r.status} ${JSON.stringify(body.error || body).slice(0, 200)}`);
+    return body;
+  }
+
   async function saGetDoc(project, token, path) {
     const r = await fetch(`${BASE(project)}/${path}`, { headers: saHeaders(token) });
     if (r.status === 404) return null;
@@ -196,7 +292,9 @@ const BASE = (project) =>
   }
 
   // Mirror of scripts/monitor.py, trimmed for the Worker sandbox (no SDK).
-  function fleetCheck(serverDocs, queuedCount, nowMs) {
+  // vmByNode: optional ground truth from Cloud Shell API (RUNNING/SUSPENDED/
+  // PENDING/unconfigured/error:...); shown in notes, never assumed.
+  function fleetCheck(serverDocs, queuedCount, nowMs, vmByNode) {
     const problems = [];
     const notes = [];
     const byId = {};
@@ -234,6 +332,21 @@ const BASE = (project) =>
       }
     }
     notes.push(`roster: ${roster.join(", ") || "none"}`);
+    const joined = Object.keys(byId).filter((id) => id.startsWith("health-")).map((id) => id.slice(7));
+    if (vmByNode) {
+      const vm = RING.map((n) => `${n}=${vmByNode[n] || "unknown"}`).join(", ");
+      notes.push(`vm: ${vm}`);
+      const running = RING.filter((n) => vmByNode[n] === "RUNNING");
+      notes.push(`vms running: ${running.length ? running.join(", ") : "none"}`);
+      for (const n of RING) {
+        if (vmByNode[n] === "SUSPENDED" && !joined.includes(n)) {
+          notes.push(`${n}: VM suspended, never joined (no health doc)`);
+        }
+      }
+    } else {
+      const missing = RING.filter((n) => !joined.includes(n));
+      if (missing.length) notes.push(`never joined (no health doc): ${missing.join(", ")}`);
+    }
 
     const quotaNotes = [];
     let successors = 0;
@@ -272,18 +385,25 @@ const BASE = (project) =>
     if (queuedCount > BACKLOG_LIMIT) {
       problems.push(`BACKLOG: ${queuedCount} queued > limit ${BACKLOG_LIMIT}`);
     }
+    if (vmByNode) {
+      const running = RING.filter((n) => vmByNode[n] === "RUNNING");
+      if (!active && running.length === 0 && !Object.values(vmByNode).some((v) => String(v).startsWith("error"))) {
+        problems.push("VMS-DARK: no Cloud Shell VM is RUNNING (Google ground truth)");
+      }
+    }
     return { ok: problems.length === 0, problems, notes, active, fence, leftByNode };
   }
 
   // Firestore-level management: free a stuck lease / steer an open lease at
   // the next ring node with quota. Never touches fenceToken (only a lease
-  // holder's transaction may increment it).
+  // holder's transaction may increment it). Returns {actions, steerTarget}.
   async function fleetManage(project, token, check, serverDocs, nowMs) {
     const actions = [];
+    let steerTarget = null;
     const byId = {};
     for (const d of serverDocs) byId[docId(d, "server")] = d;
     const leaseDoc = byId["lease"];
-    if (!leaseDoc) return actions;
+    if (!leaseDoc) return { actions, steerTarget };
     const lease = fromFields(leaseDoc.fields || {});
     const active = typeof lease.activeNode === "string" ? lease.activeNode : null;
     const expiresMs = lease.leaseExpiresAt ? Date.parse(lease.leaseExpiresAt) : NaN;
@@ -302,14 +422,14 @@ const BASE = (project) =>
         });
         actions.push(`force-expired lease of silent holder ${active} (no heartbeat for ${Math.round(silentMs / 1000)}s)`);
       }
-      return actions;
+      return { actions, steerTarget };
     }
 
     // No active node: only steer once the previous hint's grace has passed,
     // otherwise we fight the normal same-shell reclaim path.
     const pref = typeof lease.preferredNextNode === "string" ? lease.preferredNextNode : null;
     const prefMs = lease.preferredAt ? Date.parse(lease.preferredAt) : NaN;
-    if (Number.isFinite(prefMs) && nowMs - prefMs < TAKEOVER_GRACE_S * 1000) return actions;
+    if (Number.isFinite(prefMs) && nowMs - prefMs < TAKEOVER_GRACE_S * 1000) return { actions, steerTarget };
     const startIdx = RING.indexOf(pref);
     for (let step = 1; step <= RING.length; step++) {
       const node = RING[((startIdx < 0 ? -1 : startIdx) + step) % RING.length];
@@ -321,21 +441,21 @@ const BASE = (project) =>
           });
           actions.push(`steered preferredNextNode ${pref || "(none)"} -> ${node} (open lease, next with quota)`);
         }
+        steerTarget = node;
         break;
       }
     }
-    return actions;
+    return { actions, steerTarget };
   }
 
-  // One watchdog pass: check fleet, manage lease, write server/watchdog,
-  // alert on change (+30m reminder). Returns the summary object.
+  // One watchdog pass: VM truth -> check fleet, manage lease, maybe boot the
+  // steered VM, write server/watchdog, alert on change (+30m reminder).
   async function watchdogPass(env, state) {
     const project = env.GCP_PROJECT_ID;
     const nowMs = Date.now();
     const token = await saAccessToken(env.FLEET_SA_KEY, state);
     const serverDocs = await saListDocs(project, token, "server");
-    // Bounded backlog probe: list queued via query would need an index, so
-    // cap a collection scan at BACKLOG_LIMIT+1 via pageSize.
+    // Bounded backlog probe: list capped at BACKLOG_LIMIT+1 (no index needed).
     let queuedCount = 0;
     try {
       const reqDocs = await saListDocs(project, token, "requests", BACKLOG_LIMIT + 1);
@@ -349,8 +469,43 @@ const BASE = (project) =>
     } catch (e) {
       queuedCount = 0;
     }
-    const check = fleetCheck(serverDocs, queuedCount, nowMs);
-    const actions = await fleetManage(project, token, check, serverDocs, nowMs);
+    // VM ground truth (Option A). Sequential per node: 4 GETs, each with its
+    // own account token. Null when no OAuth configured at all.
+    let vmByNode = null;
+    if (oauthClient(env) && RING.some((n) => shellRefresh(env, n) && shellAccountEmail(env, n))) {
+      vmByNode = {};
+      for (const n of RING) vmByNode[n] = await shellVmState(env, state, n);
+    }
+    const check = fleetCheck(serverDocs, queuedCount, nowMs, vmByNode);
+    const { actions, steerTarget } = await fleetManage(project, token, check, serverDocs, nowMs);
+
+    // Auto-boot (gated): lease open a while, steered node has quota, its VM
+    // is SUSPENDED, and no start attempted fleet-wide within cooldown.
+    // Booting only puts the VM at a login prompt; .customize_environment on
+    // the shell must launch run.sh for it to actually rejoin.
+    if (!check.active && steerTarget && vmByNode && vmByNode[steerTarget] === "SUSPENDED"
+        && (check.leftByNode[steerTarget] ?? QUOTA_SECONDS) > 0) {
+      const prevDoc0 = await saGetDoc(project, token, `server/${WATCHDOG_DOC}`);
+      const prev0 = prevDoc0 ? fromFields(prevDoc0.fields || {}) : {};
+      const lastStart = prev0.lastVmStartAt ? Date.parse(prev0.lastVmStartAt) : NaN;
+      const leaseDoc0 = serverDocs.find((d) => docId(d, "server") === "lease");
+      const lease0 = leaseDoc0 ? fromFields(leaseDoc0.fields || {}) : {};
+      const openMs = lease0.releasedAt ? nowMs - Date.parse(lease0.releasedAt)
+        : (lease0.leaseExpiresAt ? nowMs - Date.parse(lease0.leaseExpiresAt) : 0);
+      const cooled = !Number.isFinite(lastStart) || nowMs - lastStart >= VM_START_COOLDOWN_S * 1000;
+      if (openMs >= VM_OPEN_AFTER_S * 1000 && cooled) {
+        try {
+          await shellVmStart(env, state, steerTarget);
+          actions.push(`started Cloud Shell VM for ${steerTarget} (lease open ${Math.round(openMs / 1000)}s)`);
+          await saPatchDoc(project, token, `server/${WATCHDOG_DOC}`, {
+            lastVmStartAt: { timestampValue: new Date(nowMs).toISOString() },
+            lastVmStartNode: { stringValue: steerTarget },
+          });
+        } catch (e) {
+          actions.push(`VM start FAILED for ${steerTarget}: ${String(e).slice(0, 160)}`);
+        }
+      }
+    }
 
     const prevDoc = await saGetDoc(project, token, `server/${WATCHDOG_DOC}`);
     const prev = prevDoc ? fromFields(prevDoc.fields || {}) : {};
@@ -372,6 +527,7 @@ const BASE = (project) =>
     const summary = {
       ok: check.ok, activeNode: check.active, problems: check.problems,
       notes: check.notes, actions,
+      vm: vmByNode,
       at: new Date(nowMs).toISOString(),
     };
     const wfields = {

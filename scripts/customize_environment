@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Fleet auto-rejoin hook (Option A companion).
+# Cloud Shell runs ~/.customize_environment ONCE per VM start (fresh or
+# restarted). Install with:
+#   cp fleet/scripts/customize_environment ~/.customize_environment
+#   chmod +x ~/.customize_environment
+# Then a Worker-issued `start` (or a manual reconnect after the 12h cap)
+# rejoins the fleet WITHOUT you typing anything: it pulls latest main and
+# (re)launches the supervisor in tmux. Safe to run repeatedly: bootstrap.sh
+# is idempotent (lease exists -> join, usage exists -> reuse, tmux -> replace).
+set -euo pipefail
+
+FLEET_DIR="$HOME/fleet"
+NODE_FILE="$HOME/.fleet-node-id"
+
+# First boot on this account: clone. Later boots: pull latest.
+if [[ -d "$FLEET_DIR/.git" ]]; then
+  git -C "$FLEET_DIR" pull --ff-only >/dev/null 2>&1 || true
+elif [[ ! -d "$FLEET_DIR" ]]; then
+  git clone https://github.com/AyushSuri8/fleet.git "$FLEET_DIR" >/dev/null 2>&1 || exit 0
+fi
+
+# No identity yet (brand-new shell that was never bootstrapped): record the
+# watchdog's steered hint so the first manual bootstrap defaults correctly,
+# but do NOT start anything — operator must place the SA key + confirm id.
+if [[ ! -s "$NODE_FILE" ]]; then
+  echo "fleet auto-rejoin: no node id yet ($NODE_FILE missing); skipping start." >&2
+  echo "  Place the shared SA key in ~/.secrets/, then run:" >&2
+  echo "    cd ~/fleet && FLEET_NODE_ID=shell-x ./bootstrap.sh" >&2
+  exit 0
+fi
+
+# Rejoin: bootstrap renews/takes the lease and (re)starts tmux fleet.
+cd "$FLEET_DIR"
+export FLEET_NODE_ID="$(cat "$NODE_FILE")"
+./bootstrap.sh >/dev/null 2>&1 || echo "fleet auto-rejoin: bootstrap failed, see ~/fleet/logs/${FLEET_NODE_ID}.log" >&2

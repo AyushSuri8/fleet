@@ -4,14 +4,24 @@ compatibility_date = "2024-11-01"
 
 [vars]
 GCP_PROJECT_ID = "shell-project-d2b93"
-
-# every-minute watchdog: check lease/heartbeat/quota/backlog, manage the
-# open/stuck lease, write server/watchdog, alert on change.
-[triggers]
-crons = ["* * * * *"]
+# Google account email owning each shell VM (users/<email>/environments/default).
+# Plain text by design (emails are not secret). Fill before deploy.
+SHELL_ACCOUNT_A = ""
+SHELL_ACCOUNT_B = ""
+SHELL_ACCOUNT_C = ""
+SHELL_ACCOUNT_D = ""
 
 # secrets, set once:
 #   wrangler secret put FIRESTORE_API_KEY   (public front-door reads/writes requests/*)
 #   wrangler secret put FLEET_SA_KEY        (full service-account JSON; watchdog reads/writes server/*)
+# VM truth + auto-boot (Option A, one OAuth client + one refresh token per shell):
+#   wrangler secret put OAUTH_CLIENT_ID       (Desktop-app OAuth client id)
+#   wrangler secret put OAUTH_CLIENT_SECRET   (Desktop-app OAuth client secret)
+#   wrangler secret put SHELL_A_REFRESH ... SHELL_D_REFRESH (per-account refresh tokens)
 # optional:
 #   wrangler secret put ALERT_WEBHOOK_URL   (Slack/Discord webhook for watchdog alerts)
+
+# every-minute watchdog: VM truth + lease/heartbeat/quota/backlog checks,
+# stuck/open lease management, gated VM auto-boot, server/watchdog write.
+[triggers]
+crons = ["* * * * *"]
