@@ -19,6 +19,9 @@ if ! LD_LIBRARY_PATH="" .venv/bin/python -c "import grpc" 2>/dev/null; then
 fi
 
 # --- stable node identity (persists in $HOME across rebuilds) ---
+# ALWAYS persisted to ~/.fleet-node-id (atomic, 0600), even when the id came
+# from $FLEET_NODE_ID env. run.sh is spawned as a separate tmux process and
+# needs the file when the env var isn't exported into it.
 NODE_ID="${FLEET_NODE_ID:-}"
 if [[ -z "$NODE_ID" ]]; then
   if [[ -s "$HOME/.fleet-node-id" ]]; then
@@ -26,14 +29,16 @@ if [[ -z "$NODE_ID" ]]; then
   else
     echo "First run on this node. Assign a stable id (shell-a / shell-b / shell-c / shell-d):"
     read -r NODE_ID
-    [[ "$NODE_ID" =~ ^shell-[a-d]$ ]] || { echo "id must be shell-a..shell-d"; exit 1; }
-    tmp=$(mktemp); echo "$NODE_ID" > "$tmp"; mv "$tmp" "$HOME/.fleet-node-id"; chmod 600 "$HOME/.fleet-node-id"
   fi
 fi
 if ! [[ "$NODE_ID" =~ ^shell-[a-d]$ ]]; then
   echo "NODE_ID=$NODE_ID invalid, must be shell-a..d" >&2
   exit 1
 fi
+tmp=$(mktemp)
+printf '%s\n' "$NODE_ID" > "$tmp"
+chmod 600 "$tmp"
+mv "$tmp" "$HOME/.fleet-node-id" 2>/dev/null || true
 export FLEET_NODE_ID="$NODE_ID"
 echo "==> Node id: $NODE_ID"
 
