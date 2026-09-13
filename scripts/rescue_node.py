@@ -39,6 +39,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -58,6 +59,38 @@ def log(msg):
 def die(msg, code=1):
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def _fresh_active_line(tail, boot_ref):
+    """True only if a supervisor JSON log line NEWER than boot_ref reports ACTIVE.
+
+    The log tail mixes lines from earlier sessions; matching any 'ACTIVE'
+    substring false-positives on stale lines (seen live 2026-09-13: shell-b
+    rescue matched 'still active fence=' from a 2.5h-old session and declared
+    the node rejoined before the new supervisor had even started). Lines with
+    unparseable timestamps are never trusted.
+    """
+    for line in (tail or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = str(d.get("message", ""))
+        if "ACTIVE fenceToken=" not in msg and "still active fence=" not in msg:
+            continue
+        raw = d.get("timestamp")
+        try:
+            ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            continue
+        if ts >= boot_ref:
+            return True
+    return False
 
 
 def load_client(path):
@@ -284,6 +317,9 @@ def main():
             % (node, node)
         ).strip())
 
+        # Accept only supervisor log lines written AFTER the bootstrap launch
+        # (30s skew allowance for node-vs-admin clock drift), never stale ones.
+        boot_ref = datetime.now(timezone.utc) - timedelta(seconds=30)
         deadline = time.time() + args.timeout
         joined = False
         while time.time() < deadline:
@@ -292,8 +328,7 @@ def main():
                        f"tail -n 2 ~/fleet/logs/{node}.log 2>/dev/null")
             last = " | ".join(l.strip() for l in tail.strip().splitlines()[-2:])
             print(f"    {last[:160]}")
-            if ("ACTIVE fenceToken=" in tail or '"message": "ACTIVE' in tail
-                    or "still active fence=" in tail):
+            if _fresh_active_line(tail, boot_ref):
                 joined = True
                 break
             if "ERROR:" in tail or "invalid" in tail.lower():
