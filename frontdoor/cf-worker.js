@@ -184,6 +184,43 @@ const BASE = (project) =>
     return { id: env.OAUTH_CLIENT_ID, secret: env.OAUTH_CLIENT_SECRET };
   }
 
+  function consentUrl(clientId) {
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({
+      client_id: clientId,
+      redirect_uri: "http://localhost",
+      response_type: "code",
+      scope: "https://www.googleapis.com/auth/cloud-platform",
+      access_type: "offline",
+      prompt: "consent",
+    }).toString();
+  }
+
+  // Per-node OAuth health for the re-consent helper. Returns
+  // {node, email, refreshSet, mint: "ok"|error string, needsConsent}.
+  // needsConsent = true exactly when Google answers invalid_grant (dead
+  // refresh token) — the signal to re-open the consent URL for that account.
+  async function oauthNodeStatus(env, state, node) {
+    const email = shellAccountEmail(env, node);
+    const refreshSet = Boolean(shellRefresh(env, node));
+    let mint = "unconfigured";
+    if (email && refreshSet && oauthClient(env)) {
+      try {
+        await shellAccessToken(env, state, node);
+        mint = "ok";
+      } catch (e) {
+        mint = String(e).slice(0, 160);
+      }
+    } else if (!email) {
+      mint = "no account email (set SHELL_ACCOUNT_X var)";
+    } else if (!refreshSet) {
+      mint = "no refresh secret (set SHELL_X_REFRESH)";
+    } else {
+      mint = "no OAuth client (set OAUTH_CLIENT_ID/SECRET)";
+    }
+    const needsConsent = refreshSet && /invalid_grant/i.test(mint);
+    return { node, email, refreshSet, mint, needsConsent };
+  }
+
   async function shellAccessToken(env, state, node) {
     state.shellTok = state.shellTok || {};
     const cached = state.shellTok[node];
@@ -210,6 +247,9 @@ const BASE = (project) =>
 
   // Ground truth from Google: RUNNING | SUSPENDED | PENDING | ... (or
   // "unconfigured" when no OAuth for that node, "error:..." on failure).
+  // A failed mint with invalid_grant on a Testing-mode client means the
+  // 7-day refresh token died -> surface AUTH-EXPIRED so /fleet/oauth-help
+  // can hand back the exact re-consent URL for that account.
   async function shellVmState(env, state, node) {
     const email = shellAccountEmail(env, node);
     if (!email) return "unconfigured";
@@ -294,7 +334,9 @@ const BASE = (project) =>
   // Mirror of scripts/monitor.py, trimmed for the Worker sandbox (no SDK).
   // vmByNode: optional ground truth from Cloud Shell API (RUNNING/SUSPENDED/
   // PENDING/unconfigured/error:...); shown in notes, never assumed.
-  function fleetCheck(serverDocs, queuedCount, nowMs, vmByNode) {
+  // oauth: optional per-node {needsConsent} map; dead refresh tokens become
+  // an AUTH-EXPIRED problem pointing at /fleet/oauth-help.
+  function fleetCheck(serverDocs, queuedCount, nowMs, vmByNode, oauth) {
     const problems = [];
     const notes = [];
     const byId = {};
@@ -391,6 +433,12 @@ const BASE = (project) =>
         problems.push("VMS-DARK: no Cloud Shell VM is RUNNING (Google ground truth)");
       }
     }
+    if (oauth) {
+      const dead = RING.filter((n) => oauth[n] && oauth[n].needsConsent);
+      for (const n of dead) {
+        problems.push(`AUTH-EXPIRED: ${n} refresh token dead (7-day Testing expiry) — GET /fleet/oauth-help?node=${n}`);
+      }
+    }
     return { ok: problems.length === 0, problems, notes, active, fence, leftByNode };
   }
 
@@ -472,11 +520,19 @@ const BASE = (project) =>
     // VM ground truth (Option A). Sequential per node: 4 GETs, each with its
     // own account token. Null when no OAuth configured at all.
     let vmByNode = null;
-    if (oauthClient(env) && RING.some((n) => shellRefresh(env, n) && shellAccountEmail(env, n))) {
+    let oauth = null;
+    const oauthConfigured = oauthClient(env) && RING.some((n) => shellRefresh(env, n) && shellAccountEmail(env, n));
+    if (oauthConfigured) {
       vmByNode = {};
-      for (const n of RING) vmByNode[n] = await shellVmState(env, state, n);
+      oauth = {};
+      for (const n of RING) {
+        oauth[n] = await oauthNodeStatus(env, state, n);
+        vmByNode[n] = oauth[n].needsConsent
+          ? "refresh-dead"       // dead 7-day token: no point asking Google
+          : await shellVmState(env, state, n);
+      }
     }
-    const check = fleetCheck(serverDocs, queuedCount, nowMs, vmByNode);
+    const check = fleetCheck(serverDocs, queuedCount, nowMs, vmByNode, oauth);
     const { actions, steerTarget } = await fleetManage(project, token, check, serverDocs, nowMs);
 
     // Auto-boot (gated): lease open a while, steered node has quota, its VM
@@ -528,6 +584,7 @@ const BASE = (project) =>
       ok: check.ok, activeNode: check.active, problems: check.problems,
       notes: check.notes, actions,
       vm: vmByNode,
+      oauthHelp: oauth ? "GET /fleet/oauth-help (or ?node=<shell-x>) for re-consent URLs of expired tokens" : null,
       at: new Date(nowMs).toISOString(),
     };
     const wfields = {
@@ -559,6 +616,33 @@ const BASE = (project) =>
         } catch (e) {
           return json({ error: "watchdog failed", detail: String(e).slice(0, 300) }, 502);
         }
+      }
+
+      // Re-consent helper: which shell accounts need a fresh consent, the
+      // exact URL to open (logged in as THAT account), and how to exchange
+      // the code. Week-old Testing-mode refresh tokens die with invalid_grant;
+      // this endpoint names exactly which ones. ?node=shell-b filters to one.
+      if (request.method === "GET" && pathname === "/fleet/oauth-help") {
+        const client = oauthClient(env);
+        if (!client) return json({ error: "OAUTH_CLIENT_ID/SECRET not set" }, 503);
+        const url = new URL(request.url);
+        const only = url.searchParams.get("node");
+        const nodes = only ? [only].filter((n) => RING.includes(n)) : RING;
+        if (only && !nodes.length) return json({ error: `unknown node ${only}` }, 400);
+        const state = {};
+        const accounts = [];
+        for (const n of nodes) accounts.push(await oauthNodeStatus(env, state, n));
+        const exchange = "curl -s -X POST https://oauth2.googleapis.com/token "
+          + `-d "client_id=${client.id}" -d "client_secret=$OAUTH_CLIENT_SECRET" `
+          + `-d "code=PASTE_CODE" -d "grant_type=authorization_code" -d "redirect_uri=http://localhost"`;
+        return json({
+          consentUrl: consentUrl(client.id),
+          openAs: "the Google account that owns that shell (one consent per node)",
+          afterConsent: "copy the ?code= from the http://localhost/?code=... address bar, exchange it within minutes (codes are single-use)",
+          exchangeCurl: exchange,
+          storeAs: "wrangler secret put SHELL_<A|B|C|D>_REFRESH  (then redeploy)",
+          accounts,
+        });
       }
   
       if (request.method === "POST" && pathname === "/jobs") {
