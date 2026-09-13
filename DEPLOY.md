@@ -122,7 +122,7 @@ chmod 600 ~/.secrets/shell-project-d2b93-331fa174bc3e.json
 
 cp scripts/customize_environment ~/.customize_environment && chmod +x ~/.customize_environment
 
-FLEET_NODE_ID=shell-x ./bootstrap.sh
+FLEET_NODE_ID=shell-a ./bootstrap.sh
 ./fleetctl.sh status
 ```
 
@@ -187,4 +187,37 @@ video — not worth it for 4 known users.
 - **`/fleet/status` shows fleet dark (`ok:false, no activeNode`):** correct —
   no shell currently holds the lease. The watchdog manages the agreement, the
   shells + the auto-boot hook make it real.
+
+---
+
+## 10. Rescuing a wedged node — `scripts/rescue_node.py`
+
+The auto-rejoin hook (`.customize_environment`) only fires when a REAL session
+attaches to a Cloud Shell VM. The watchdog's API `:start` boots the VM but
+never triggers the hook, so a node suspended mid-lease (or freshly rebuilt)
+stays out of the fleet forever. This script reproduces an attach from the
+terminal: mint from that node's refresh token → `users/me/environments/default`
+(resolves account + SSH endpoint) → `:start` if needed → throwaway ECDSA key
+via `:addPublicKey` → SSH in with paramiko → run `./bootstrap.sh` detached →
+wait for the supervisor to log `ACTIVE fenceToken=` → `:removePublicKey`.
+
+```bash
+.venv/bin/python scripts/rescue_node.py shell-c          # guided (asks y/N)
+.venv/bin/python scripts/rescue_node.py shell-c --yes    # unattended
+.venv/bin/python scripts/rescue_node.py shell-c --plan-only   # read-only
+```
+
+Notes:
+- Needs the node's refresh token at `.secrets/SHELL_<A|B|C|D>_REFRESH.txt`
+  (rotate it first with §4/§5 if `--check` says `invalid_grant`).
+- Needs `paramiko` in `.venv` (no `ssh` binary on Cloud Shell).
+- The node must already have `~/fleet` with the shared SA key under
+  `~/fleet/.secrets/` (DEPLOY.md §6) — the script checks and aborts otherwise.
+- It never touches `server/lease`: if the lease is still held by a dead node,
+  deploy the watchdog reap fix (frontdoor/cf-worker.js) or clear `activeNode`
+  in Firestore by hand first.
+- If it dies between key-add and cleanup, one no-comment ecdsa key stays
+  registered on the environment (its private half is deleted, so it is dead
+  weight, not a risk). Remove it via `:removePublicKey` if you want a tidy
+  key list.
 
