@@ -1,0 +1,20 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Front-door clients may create and read jobs; nothing else.
+    // Workers (Admin SDK via ADC) bypass rules entirely, so they are unaffected.
+    match /requests/{jobId} {
+      allow create: if request.resource.data.status == 'queued'
+                    && request.resource.data.type is string
+                    && request.resource.data.attempts == 0;
+      allow get, list: if true;
+      allow update, delete: if false;
+    }
+
+    // lease / health-* / everything else: closed to clients
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

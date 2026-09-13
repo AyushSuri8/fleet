@@ -1,0 +1,39 @@
+{
+    "gcp": { "project_id": "shell-project-d2b93" },
+    "node": { "id": "" },
+    "lease": {
+      "collection": "server",
+      "doc_id": "lease",
+      "ttl_seconds": 90,
+      "poll_interval_seconds": 10,
+      "takeover_grace_seconds": 45
+    },
+    "heartbeat": {
+      "collection": "server",
+      "doc_prefix": "health-",
+      "interval_seconds": 30
+    },
+    "rotation": {
+      "enabled": true,
+      "mode": "sticky-quota",
+      "max_active_seconds": 0,
+      "order": ["shell-a", "shell-b", "shell-c", "shell-d"],
+      "weekly_quota_seconds": 180000,
+      "week_seconds": 604800,
+      "reclaim_grace_seconds": 90
+    },
+    "server": {
+      "command": "worker",
+      "status_file": "~/.fleet/status.json"
+    },
+    "queue": {
+      "requests_collection": "requests",
+      "poll_interval_seconds": 5,
+      "batch_size": 5,
+      "job_lease_seconds": 300,
+      "max_attempts": 3
+    },
+    "worker": {
+      "status_file": "~/.fleet/status.json"
+    }
+  }

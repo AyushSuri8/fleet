@@ -1,0 +1,12 @@
+.secrets/
+logs/
+.venv/
+__pycache__/
+*.pyc
+.env
+*.log
+config/local.json
+config/*.override.json
+firebase-debug.log
+firestore-debug.log
+.fleet/

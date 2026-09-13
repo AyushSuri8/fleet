@@ -1,0 +1,33 @@
+name: monitor
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 5 min is the GitHub minimum; runs may lag a few minutes
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install google-cloud-firestore
+      - name: write SA creds
+        run: |
+          echo "$FIREBASE_SERVICE_ACCOUNT" > "$HOME/sa.json"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/sa.json" >> "$GITHUB_ENV"
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+      - name: run checks
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.GCP_PROJECT_ID }}
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}   # optional Slack/Discord webhook
+        run: python scripts/monitor.py
+      - name: keep-render-warm (no-op unless RENDER_URL secret set)
+        run: |
+          if [ -n "$RENDER_URL" ]; then curl -fsS --max-time 30 "$RENDER_URL/healthz" || true; fi
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
