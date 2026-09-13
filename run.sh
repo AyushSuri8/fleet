@@ -32,7 +32,10 @@ if ! [[ "$FLEET_NODE_ID" =~ ^shell-[a-d]$ ]]; then
   exit 1
 fi
 
-# --- project / credentials ---
+# --- project / credentials: SINGLE shared Firestore for all nodes ---
+# Same rule as bootstrap.sh: every shell must use the shared SA key, otherwise
+# per-account gcloud ADC silently creates 4 separate fleets. Fail loudly.
+SHARED_PROJECT="shell-project-d2b93"
 if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
   if [[ -f "$HOME/.secrets/shell-project-d2b93-331fa174bc3e.json" ]]; then
     export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.secrets/shell-project-d2b93-331fa174bc3e.json"
@@ -40,10 +43,16 @@ if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
     export GOOGLE_APPLICATION_CREDENTIALS="$(dirname "$0")/.secrets/shell-project-d2b93-331fa174bc3e.json"
   fi
 fi
-export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-shell-project-d2b93}"
-# prefer config project_id over env if empty
-if [[ -z "$GOOGLE_CLOUD_PROJECT" ]]; then
-  export GOOGLE_CLOUD_PROJECT="shell-project-d2b93"
+if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" || ! -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+  echo "ERROR: shared service-account key not found; refusing per-account gcloud ADC fallback." >&2
+  echo "  Copy shell-project-d2b93-*.json to ~/.secrets/ (same key on all shells)." >&2
+  exit 1
+fi
+if [[ -z "${GOOGLE_CLOUD_PROJECT:-}" || "$GOOGLE_CLOUD_PROJECT" == "(unset)" ]]; then
+  export GOOGLE_CLOUD_PROJECT="$SHARED_PROJECT"
+fi
+if [[ "$GOOGLE_CLOUD_PROJECT" != "$SHARED_PROJECT" ]]; then
+  echo "WARNING: GOOGLE_CLOUD_PROJECT=$GOOGLE_CLOUD_PROJECT != shared $SHARED_PROJECT (separate fleet!)" >&2
 fi
 
 mkdir -p logs

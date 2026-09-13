@@ -21,6 +21,12 @@ if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
     export GOOGLE_APPLICATION_CREDENTIALS="$(dirname "$0")/.secrets/shell-project-d2b93-331fa174bc3e.json"
   fi
 fi
+# Single shared Firestore: refuse per-account gcloud ADC fallback (4 separate fleets).
+if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" || ! -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
+  echo "ERROR: shared service-account key not found; refusing per-account gcloud ADC fallback." >&2
+  echo "  Copy shell-project-d2b93-*.json to ~/.secrets/ (same key on all shells)." >&2
+  exit 1
+fi
 
 CMD="${1:-status}"
 PYTHON=".venv/bin/python"

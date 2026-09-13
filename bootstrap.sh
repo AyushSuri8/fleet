@@ -38,24 +38,43 @@ export FLEET_NODE_ID="$NODE_ID"
 echo "==> Node id: $NODE_ID"
 
 # --- auth & project ---
-# Other-account Firestore is fine: if SA key is provided, use it and skip gcloud login check.
-if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
-  echo "==> Using service account key: $GOOGLE_APPLICATION_CREDENTIALS"
-elif [[ -f "$HOME/.secrets/shell-project-d2b93-331fa174bc3e.json" ]]; then
-  export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.secrets/shell-project-d2b93-331fa174bc3e.json"
-  echo "==> Using service account key: $GOOGLE_APPLICATION_CREDENTIALS"
-elif [[ -f "$(dirname "$0")/.secrets/shell-project-d2b93-331fa174bc3e.json" ]]; then
-  export GOOGLE_APPLICATION_CREDENTIALS="$(dirname "$0")/.secrets/shell-project-d2b93-331fa174bc3e.json"
-  echo "==> Using service account key: $GOOGLE_APPLICATION_CREDENTIALS"
-else
-  gcloud auth list --filter=status:ACTIVE --format="value(account)" | head -n1 | grep -q . \
-    || { echo "No active gcloud account. Run: gcloud auth login"; exit 1; }
+# SINGLE shared Firestore: shell-project-d2b93 holds server/lease for ALL nodes.
+# Every shell (shell-a..d, different Google accounts) must authenticate as the
+# SAME service account, otherwise each account silently gets its own Firestore
+# and you end up with 4 independent fleets. Fail loudly instead of allowing
+# per-account gcloud auth fallback.
+SHARED_PROJECT="shell-project-d2b93"
+SA_KEY_CANDIDATES=(
+  "${GOOGLE_APPLICATION_CREDENTIALS:-}"
+  "$HOME/.secrets/shell-project-d2b93-331fa174bc3e.json"
+  "$(dirname "$0")/.secrets/shell-project-d2b93-331fa174bc3e.json"
+)
+SA_KEY=""
+for cand in "${SA_KEY_CANDIDATES[@]}"; do
+  [[ -n "$cand" && -f "$cand" ]] || continue
+  SA_KEY="$cand"
+  break
+done
+if [[ -z "$SA_KEY" ]]; then
+  echo "ERROR: shared service-account key not found." >&2
+  echo "  All fleet nodes must use the SAME key so they share one Firestore." >&2
+  echo "  Copy shell-project-d2b93-*.json to ~/.secrets/ on this shell, then re-run." >&2
+  echo "  (Refusing per-account 'gcloud auth' fallback: it creates 4 separate fleets.)" >&2
+  exit 1
 fi
-PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-$(gcloud config get-value project 2>/dev/null || true)}"
-[[ "$PROJECT_ID" == "(unset)" ]] && PROJECT_ID=""
-[[ -n "$PROJECT_ID" ]] || { echo "Run: gcloud config set project PROJECT_ID"; exit 1; }
+export GOOGLE_APPLICATION_CREDENTIALS="$SA_KEY"
+echo "==> Using shared service account key: $SA_KEY"
+PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-$SHARED_PROJECT}"
+if [[ "$PROJECT_ID" != "$SHARED_PROJECT" ]]; then
+  echo "WARNING: GOOGLE_CLOUD_PROJECT=$PROJECT_ID overrides shared project $SHARED_PROJECT." >&2
+  echo "  Only override if you really mean a separate fleet. Continuing in 5s (Ctrl-C to abort)..." >&2
+  sleep 5
+fi
+if [[ "$PROJECT_ID" == "(unset)" || -z "$PROJECT_ID" ]]; then
+  PROJECT_ID="$SHARED_PROJECT"
+fi
 export GOOGLE_CLOUD_PROJECT="$PROJECT_ID"
-echo "==> Project: $PROJECT_ID"
+echo "==> Project: $PROJECT_ID (shared Firestore for all nodes)"
 
 # --- dependencies (root disk is ephemeral; reinstall every boot) ---
 echo "==> Installing Python dependencies"
