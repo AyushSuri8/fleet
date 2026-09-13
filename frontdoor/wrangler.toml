@@ -5,4 +5,13 @@ compatibility_date = "2024-11-01"
 [vars]
 GCP_PROJECT_ID = "shell-project-d2b93"
 
-# secret, set once:  wrangler secret put FIRESTORE_API_KEY
+# every-minute watchdog: check lease/heartbeat/quota/backlog, manage the
+# open/stuck lease, write server/watchdog, alert on change.
+[triggers]
+crons = ["* * * * *"]
+
+# secrets, set once:
+#   wrangler secret put FIRESTORE_API_KEY   (public front-door reads/writes requests/*)
+#   wrangler secret put FLEET_SA_KEY        (full service-account JSON; watchdog reads/writes server/*)
+# optional:
+#   wrangler secret put ALERT_WEBHOOK_URL   (Slack/Discord webhook for watchdog alerts)
