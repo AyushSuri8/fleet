@@ -442,10 +442,11 @@ const BASE = (project) =>
     return { ok: problems.length === 0, problems, notes, active, fence, leftByNode };
   }
 
-  // Firestore-level management: free a stuck lease / steer an open lease at
-  // the next ring node with quota. Never touches fenceToken (only a lease
-  // holder's transaction may increment it). Returns {actions, steerTarget}.
-  async function fleetManage(project, token, check, serverDocs, nowMs) {
+  // Firestore-level management: reap a dead holder / free a stuck lease /
+  // steer an open lease at the next ring node with quota. Never touches
+  // fenceToken (only a lease holder's transaction may increment it).
+  // Returns {actions, steerTarget}.
+  async function fleetManage(project, token, check, serverDocs, nowMs, vmByNode) {
     const actions = [];
     let steerTarget = null;
     const byId = {};
@@ -470,14 +471,37 @@ const BASE = (project) =>
         });
         actions.push(`force-expired lease of silent holder ${active} (no heartbeat for ${Math.round(silentMs / 1000)}s)`);
       }
-      return { actions, steerTarget };
+      // Dead-holder reap: an expired lease that still names an activeNode
+      // wedges the fleet forever — shells only claim an EXPIRED lease, but
+      // they defer while the doc still has an activeNode, and the auto-boot
+      // gate needs an open lease. Seen live 2026-09-13: shell-b was suspended
+      // mid-lease (no graceful release), watchdog ticked forever reporting
+      // LEASE-STALE with zero actions. Clear the holder, then fall through
+      // to steering so the same pass picks the boot target.
+      const stale = !Number.isFinite(expiresMs) || expiresMs < nowMs - LEASE_MAX_AGE_S * 1000;
+      if (!unexpired && stale) {
+        const vmState = vmByNode ? String(vmByNode[active] || "unknown") : "unknown";
+        await saPatchDoc(project, token, "server/lease", {
+          activeNode: { nullValue: null },
+          status: { stringValue: "standby" },
+          releasedAt: { timestampValue: lease.leaseExpiresAt || new Date(nowMs).toISOString() },
+          releaseReason: { stringValue: `watchdog-reaped-${vmState === "SUSPENDED" ? "vm-suspended" : "stale-holder"}` },
+        });
+        actions.push(`reaped dead holder ${active}: lease expired ${Math.max(0, Math.round((nowMs - expiresMs) / 1000))}s ago, vm=${vmState} -> lease open`);
+      } else if (unexpired) {
+        // Live or recently-expired holder inside the stale window: hands off.
+        return { actions, steerTarget };
+      }
     }
 
     // No active node: only steer once the previous hint's grace has passed,
-    // otherwise we fight the normal same-shell reclaim path.
+    // otherwise we fight the normal same-shell reclaim path — unless ground
+    // truth says NO VM is RUNNING, in which case nobody can reclaim and
+    // waiting would just delay the auto-boot of a dark fleet.
     const pref = typeof lease.preferredNextNode === "string" ? lease.preferredNextNode : null;
     const prefMs = lease.preferredAt ? Date.parse(lease.preferredAt) : NaN;
-    if (Number.isFinite(prefMs) && nowMs - prefMs < TAKEOVER_GRACE_S * 1000) return { actions, steerTarget };
+    const runningAny = vmByNode ? RING.some((n) => vmByNode[n] === "RUNNING") : false;
+    if (runningAny && Number.isFinite(prefMs) && nowMs - prefMs < TAKEOVER_GRACE_S * 1000) return { actions, steerTarget };
     const startIdx = RING.indexOf(pref);
     for (let step = 1; step <= RING.length; step++) {
       const node = RING[((startIdx < 0 ? -1 : startIdx) + step) % RING.length];
@@ -533,7 +557,7 @@ const BASE = (project) =>
       }
     }
     const check = fleetCheck(serverDocs, queuedCount, nowMs, vmByNode, oauth);
-    const { actions, steerTarget } = await fleetManage(project, token, check, serverDocs, nowMs);
+    const { actions, steerTarget } = await fleetManage(project, token, check, serverDocs, nowMs, vmByNode);
 
     // Auto-boot (gated): lease open a while, steered node has quota, its VM
     // is SUSPENDED, and no start attempted fleet-wide within cooldown.
