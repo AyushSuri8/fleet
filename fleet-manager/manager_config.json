@@ -9,7 +9,7 @@
   "frontdoor_token": "",
 
   "ring": ["shell-a", "shell-b", "shell-c", "shell-d"],
-  "ssh_key": "~/.fleet-manager/id_ed25519",
+  "ssh_key": "~/.fleet-manager/id_ecdsa",
   "oauth_client_file": "secrets/oauth-client.json",
   "secrets_dir": "secrets",
   "db_path": "fleet.db",

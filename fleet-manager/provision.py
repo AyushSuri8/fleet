@@ -53,7 +53,9 @@ def main():
     if not key.exists():
         key.parent.mkdir(parents=True, exist_ok=True)
         print(f"generating manager SSH key at {key}")
-        sh(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(key)])
+        # ECDSA + empty comment: Cloud Shell :addPublicKey answers 500 to
+        # ed25519 keys and to trailing "user@host" comments (see cloudshell.py).
+        sh(["ssh-keygen", "-t", "ecdsa", "-b", "256", "-N", "", "-C", "", "-f", str(key)])
     pub = Path(str(key) + ".pub").read_text().strip()
 
     client_file = Path(cfg["oauth_client_file"]).expanduser()

@@ -103,9 +103,14 @@ class CloudShell:
 
     def add_public_key(self, pub):
         """Register the manager's public key. Best-effort idempotent: a
-        duplicate registration is fine — SSH connectivity is the real test."""
+        duplicate registration is fine — SSH connectivity is the real test.
+
+        Sends only the bare "type blob" pair: the API answers 500 to ed25519
+        keys and to trailing "user@host" comments (ssh-keygen default), while
+        bare ECDSA registers with done:true."""
+        bare = " ".join(str(pub).split()[:2])
         st, op = self._call("POST", "users/me/environments/default:addPublicKey",
-                            body={"key": pub})
+                            body={"key": bare})
         if st not in (200, 201):
             return False
         name = op.get("name", "")
