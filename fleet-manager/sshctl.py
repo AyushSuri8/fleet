@@ -41,7 +41,8 @@ class NodeSSH:
                 "-o", f"ControlPath={self._ctl()}",
                 "-o", "ControlPersist=600",
                 "-o", "ConnectTimeout=20",
-                "-o", "BatchMode=yes"]
+                "-o", "BatchMode=yes",
+                "-n"]  # stdin from /dev/null: never hold the channel open
 
     def _close_master(self):
         subprocess.run(["ssh", "-o", f"ControlPath={self._ctl()}", "-O", "exit"],
@@ -86,7 +87,10 @@ class NodeSSH:
     def start_agent(self):
         """(Re)start the pull agent. Config comes from ~/fleet-agent/agent_config.json."""
         self.try_run("pkill -f '[a]gent.py' || true; sleep 1")
+        # </dev/null + disown: without these the sshd channel can stay open
+        # (Cloud Shell's wrapper holds the pipe), hanging the client despite
+        # the process being backgrounded with output redirected.
         out = self.run(
-            "cd ~/fleet-agent && nohup python3 agent.py >> agent.log 2>&1 & echo PID=$!",
+            "cd ~/fleet-agent && nohup python3 agent.py >> agent.log 2>&1 </dev/null & disown; echo PID=$!",
             timeout=30)
         return out.strip()
