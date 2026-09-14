@@ -33,16 +33,20 @@ class NodeSSH:
     def _ctl(self):
         return f"{self.runtime}/{self.node}-{self.endpoint[0]}:{self.endpoint[1]}"
 
-    def _opts(self):
-        return ["-i", self.key,
+    def _opts(self, for_scp=False):
+        opts = ["-i", self.key,
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "ControlMaster=auto",
                 "-o", f"ControlPath={self._ctl()}",
                 "-o", "ControlPersist=600",
                 "-o", "ConnectTimeout=20",
-                "-o", "BatchMode=yes",
-                "-n"]  # stdin from /dev/null: never hold the channel open
+                "-o", "BatchMode=yes"]
+        if not for_scp:
+            # stdin from /dev/null: never hold the channel open.
+            # (scp on some OpenSSH builds rejects -n, so it is ssh-only.)
+            opts.append("-n")
+        return opts
 
     def _close_master(self):
         subprocess.run(["ssh", "-o", f"ControlPath={self._ctl()}", "-O", "exit"],
@@ -69,7 +73,7 @@ class NodeSSH:
 
     def upload(self, local, remote):
         host, port, user = self.endpoint
-        argv = ["scp", *self._opts(), "-P", str(port),
+        argv = ["scp", *self._opts(for_scp=True), "-P", str(port),
                 str(Path(local).expanduser()), f"{user}@{host}:{remote}"]
         r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
