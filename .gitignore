@@ -10,3 +10,11 @@ config/*.override.json
 firebase-debug.log
 firestore-debug.log
 .fleet/
+fleet-manager/fleet.db*
+fleet-manager/runtime/*
+!fleet-manager/runtime/.gitkeep
+fleet-manager/secrets/*
+!fleet-manager/secrets/.gitkeep
+fleet-manager/tls/*
+!fleet-manager/tls/.gitkeep
+fleet-manager/agent/agent_config.json

@@ -1,0 +1,14 @@
+[Unit]
+Description=Fleet manager (Oracle control plane)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/fleet-manager
+ExecStart=/usr/bin/python3 manager.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+{
+  "public_url": "https://YOUR.ORACLE.PUBLIC.IP:8443",
+  "listen_host": "0.0.0.0",
+  "listen_port": 8443,
+  "tls_cert": "tls/fleet.crt",
+  "tls_key": "tls/fleet.key",
+
+  "agent_token": "PASTE_OUTPUT_OF_openssl_rand_hex_32",
+  "frontdoor_token": "",
+
+  "ring": ["shell-a", "shell-b", "shell-c", "shell-d"],
+  "ssh_key": "~/.fleet-manager/id_ed25519",
+  "oauth_client_file": "secrets/oauth-client.json",
+  "secrets_dir": "secrets",
+  "db_path": "fleet.db",
+
+  "poll_seconds": 30,
+  "cap_hours": 11,
+  "quota_seconds": 180000,
+  "week_seconds": 604800,
+  "heartbeat_stale_seconds": 90,
+
+  "job_lease_seconds": 300,
+  "max_attempts": 3,
+  "agent_long_poll_seconds": 25,
+  "allow_standby_claims": false
+}
