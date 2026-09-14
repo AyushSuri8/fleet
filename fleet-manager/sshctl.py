@@ -9,6 +9,7 @@ The ControlMaster socket keeps one authenticated connection alive per node,
 so the every-30s keepalive probe is cheap — and doubles as the anti-idle
 activity that stops Google from suspending an "idle" VM."""
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -89,12 +90,32 @@ class NodeSSH:
         self.try_run("pkill -f '[a]gent.py' || true")
 
     def start_agent(self):
-        """(Re)start the pull agent. Config comes from ~/fleet-agent/agent_config.json."""
+        """(Re)start the pull agent. Config comes from ~/fleet-agent/agent_config.json.
+
+        Launches via a double-fork (setsid, all fds closed): shell `&`
+        backgrounding hangs the SSH channel on Cloud Shell's proxy even with
+        output redirected and stdin from /dev/null. If the channel still
+        hangs, falls back to verifying by process presence — the agent is
+        what matters, not the launch command's exit status."""
         self.try_run("pkill -f '[a]gent.py' || true; sleep 1")
-        # </dev/null + disown: without these the sshd channel can stay open
-        # (Cloud Shell's wrapper holds the pipe), hanging the client despite
-        # the process being backgrounded with output redirected.
-        out = self.run(
-            "cd ~/fleet-agent && nohup python3 agent.py >> agent.log 2>&1 </dev/null & disown; echo PID=$!",
-            timeout=30)
-        return out.strip()
+        launch = ("cd ~/fleet-agent && python3 -c "
+                  "'import subprocess;"
+                  "log=open(\"agent.log\",\"ab\",0);"
+                  "p=subprocess.Popen([\"python3\",\"agent.py\"],"
+                  "stdin=subprocess.DEVNULL,stdout=log,"
+                  "stderr=subprocess.STDOUT,"
+                  "start_new_session=True,close_fds=True);"
+                  "print(\"PID=%d\"%p.pid)'")
+        out = ""
+        try:
+            out = self.run(launch, timeout=30).strip()
+        except SSHError as e:
+            if "timed out" not in str(e):
+                raise
+            # channel hung — the agent may still have started; verify below
+        for _ in range(6):
+            ok, ps = self.try_run("pgrep -f '[a]gent.py'")
+            if ok and ps.strip():
+                return out or f"PID=? ({ps.strip().splitlines()[0][:60]} via pgrep)"
+            time.sleep(5)
+        raise SSHError(f"{self.node}: agent did not appear after launch")
