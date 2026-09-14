@@ -144,7 +144,16 @@ PUBURL=$(python3 -c "import json; print(json.load(open('manager_config.json'))['
 if curl -sk --max-time 15 "$PUBURL/fleet/status" | python3 -m json.tool; then
   echo "    verify OK"
 else
-  echo "    verify FAILED — check: journalctl -u fleet-manager -n 50; OCI security list 8443; secrets"
+  echo "    public-URL check failed; trying localhost to isolate the cause ..."
+  if curl -sk --max-time 10 https://127.0.0.1:8443/fleet/status | python3 -m json.tool >/dev/null; then
+    echo "    localhost WORKS but public URL does not -> inbound 8443 is blocked"
+    echo "    outside, or hairpin NAT (harmless). Do the OCI click below, then"
+    echo "    re-verify from your laptop: curl -sk $PUBURL/fleet/status"
+  else
+    echo "    localhost ALSO fails -> manager itself is down."
+    echo "    journal: journalctl -u fleet-manager -n 50"
+  fi
+  echo "    MANUAL: OCI Console -> VCN -> Security List -> Ingress 0.0.0.0/0 TCP 8443"
   exit 1
 fi
 echo "DONE. follow logs with: journalctl -u fleet-manager -f"
