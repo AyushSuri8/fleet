@@ -161,28 +161,18 @@ class Fleet:
             time.sleep(delay)
         return False
 
-    def _cleanup_failed_activation(self, node):
-        """Stop the agent AND sever SSH so Google can idle-suspend the VM.
-
-        There is NO suspend/stop API for Cloud Shell — the only lever is to
-        go fully quiet: no agent heartbeats AND no ControlMaster keepalive.
-        The manager's every-30s SSH probe is itself activity that keeps an
-        "idle" VM alive, so the master socket must be closed. Never raises.
-        """
-        try:
-            self.sshs[node].stop_agent()
-        except Exception:
-            pass
-        try:
-            # Sever the ControlMaster socket: without this, the persistent
-            # multiplexed connection keeps the VM looking busy to Google's
-            # idle reaper. After this, the next tick's probe re-opens the
-            # connection only if/when this node is retried.
-            self.sshs[node]._close_master()
-        except Exception:
-            pass
-        self.event("cleanup", f"{node}: stopped agent and severed SSH "
-                              f"so Google idle-suspend can reclaim the VM")
+        def _cleanup_failed_activation(self, node):
+            """Stop the agent and sever SSH so Google can idle-suspend the VM."""
+            try:
+                self.sshs[node].stop_agent()
+            except SSHError:
+                pass
+            try:
+                # Sever the SSH master connection so Google's idle reaper can suspend the VM
+                self.sshs[node]._close_master()
+            except Exception:
+                pass
+            self.event("cleanup", f"stopped agent and severed SSH for {node}")
 
     def _activate(self, node, reason):
         """Boot the VM if needed, (re)start the agent, wait for its heartbeat.
