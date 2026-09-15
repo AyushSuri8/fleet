@@ -162,17 +162,26 @@ class Fleet:
         return False
 
     def _cleanup_failed_activation(self, node):
-        """Best-effort cleanup so a failed activation stops burning quota.
+        """Stop the agent AND sever SSH so Google can idle-suspend the VM.
 
         There is NO suspend/stop API for Cloud Shell — the only lever is to
-        stop the agent (and any keepalive SSH traffic) so Google's idle
-        detection can suspend the VM on its own. Never raises.
+        go fully quiet: no agent heartbeats AND no ControlMaster keepalive.
+        The manager's every-30s SSH probe is itself activity that keeps an
+        "idle" VM alive, so the master socket must be closed. Never raises.
         """
         try:
             self.sshs[node].stop_agent()
         except Exception:
             pass
-        self.event("cleanup", f"{node}: stopped agent after failed activation "
+        try:
+            # Sever the ControlMaster socket: without this, the persistent
+            # multiplexed connection keeps the VM looking busy to Google's
+            # idle reaper. After this, the next tick's probe re-opens the
+            # connection only if/when this node is retried.
+            self.sshs[node]._close_master()
+        except Exception:
+            pass
+        self.event("cleanup", f"{node}: stopped agent and severed SSH "
                               f"so Google idle-suspend can reclaim the VM")
 
     def _activate(self, node, reason):
@@ -329,6 +338,13 @@ class Fleet:
                     try:
                         self.sshs[old].stop_agent()
                     except SSHError:
+                        pass
+                    try:
+                        # Same idle-suspend logic as cleanup: the demoted VM
+                        # must go fully quiet (no agent, no master socket) or
+                        # its quota keeps burning after rotation.
+                        self.sshs[old]._close_master()
+                    except Exception:
                         pass
                     # No suspend/stop API exists: stopping the agent (and all
                     # keepalive SSH traffic) lets Google idle-suspend the old VM.

@@ -50,8 +50,15 @@ class NodeSSH:
         return opts
 
     def _close_master(self):
-        subprocess.run(["ssh", "-o", f"ControlPath={self._ctl()}", "-O", "exit"],
-                       capture_output=True, timeout=15)
+        # Closing a master with no live socket is fine (ssh exits nonzero);
+        # never raise — callers use this on best-effort cleanup paths.
+        try:
+            if not self.endpoint:
+                return
+            subprocess.run(["ssh", "-o", f"ControlPath={self._ctl()}", "-O", "exit"],
+                           capture_output=True, timeout=15)
+        except Exception:
+            pass
 
     def run(self, cmd, timeout=60):
         if not self.endpoint:
@@ -62,6 +69,14 @@ class NodeSSH:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             raise SSHError(f"{self.node}: ssh timed out after {timeout}s")
+        if r.returncode == 255 and r.stdout.strip():
+            # Cloud Shell's SSH proxy tears the connection down with an
+            # exit-signal (ssh reports rc=255) right AFTER a fast command
+            # (echo/pkill/pgrep/...) already produced its output. Output
+            # present => the command ran; treat as success and keep the
+            # stdout. (Empty stdout + 255 still means a real failure:
+            # refused connection, dead endpoint, auth problem, ...).
+            return r.stdout
         if r.returncode != 0:
             raise SSHError(f"{self.node}: ssh rc={r.returncode}: {r.stderr.strip()[:200]}")
         return r.stdout
@@ -87,7 +102,18 @@ class NodeSSH:
         return ok and "up" in out
 
     def stop_agent(self):
-        self.try_run("pkill -f '[a]gent.py' || true")
+        """Best-effort kill of the agent. Never raises.
+
+        pkill is a fast-exiting command on Cloud Shell's proxy, which tears
+        the channel down with rc=255 right after the kill runs. run()
+        already tolerates 255-with-output, and anything else (255 with
+        empty output, timeouts) is swallowed here by design: a failed kill
+        attempt must never break activation/rotation/cleanup paths.
+        """
+        try:
+            self.run("pkill -f '[a]gent.py' || true", timeout=15)
+        except SSHError:
+            pass
 
     def start_agent(self):
         """(Re)start the pull agent. Config comes from ~/fleet-agent/agent_config.json.
